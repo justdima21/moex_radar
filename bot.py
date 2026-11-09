@@ -268,51 +268,116 @@ async def handle_delete_alert(query: CallbackQuery):
         await query.answer("Не удалось найти алерт.", show_alert=True)
 
 
+async def fast_price_alerts_monitor():
+    """Сверхбыстрый монитор алертов: проверяет только тикеры пользователей каждые 3 секунды."""
+    logger.info("Сверхбыстрый скальперский монитор алертов запущен (3 сек).")
+    await asyncio.sleep(5)
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                active_alerts = get_active_price_alerts()
+                if not active_alerts:
+                    await asyncio.sleep(3)
+                    continue
+
+                tickers_to_check = list({a[2] for a in active_alerts})
+                tickers_str = ",".join(tickers_to_check)
+
+                latest_prices = {}
+
+                # 1. Запрашиваем акции (TQBR)
+                url_stocks = f"https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities.json?securities={tickers_str}&iss.meta=off&iss.only=marketdata&marketdata.columns=SECID,LAST,HIGH,LOW,LASTCHANGEPRCNT"
+                try:
+                    async with session.get(url_stocks, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            for row in data.get("marketdata", {}).get("data", []):
+                                if row and row[0] and row[1] is not None:
+                                    latest_prices[row[0]] = {
+                                        "last": float(row[1]),
+                                        "high": float(row[2]) if row[2] is not None else float(row[1]),
+                                        "low": float(row[3]) if row[3] is not None else float(row[1]),
+                                        "chg": float(row[4]) if row[4] is not None else 0.0,
+                                        "type": "акция (TQBR)"
+                                    }
+                except Exception:
+                    pass
+
+                # 2. Проверяем фьючерсы (FORTS) для тех, кого не нашли в акциях
+                missing_tickers = [t for t in tickers_to_check if t not in latest_prices]
+                if missing_tickers:
+                    fut_str = ",".join(missing_tickers)
+                    url_futs = f"https://iss.moex.com/iss/engines/futures/markets/forts/boards/RFUD/securities.json?securities={fut_str}&iss.meta=off&iss.only=marketdata&marketdata.columns=SECID,LAST,HIGH,LOW,LASTCHANGEPRCNT"
+                    try:
+                        async with session.get(url_futs, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                for row in data.get("marketdata", {}).get("data", []):
+                                    if row and row[0] and row[1] is not None:
+                                        latest_prices[row[0]] = {
+                                            "last": float(row[1]),
+                                            "high": float(row[2]) if row[2] is not None else float(row[1]),
+                                            "low": float(row[3]) if row[3] is not None else float(row[1]),
+                                            "chg": float(row[4]) if row[4] is not None else 0.0,
+                                            "type": "фьючерс (FORTS)"
+                                        }
+                    except Exception:
+                        pass
+
+                # 3. Мгновенная проверка условий
+                for alert_id, chat_id, ticker, target_price, condition in active_alerts:
+                    price_info = latest_prices.get(ticker)
+                    if not price_info:
+                        continue
+
+                    curr_price = price_info["last"]
+                    curr_high = price_info["high"]
+                    curr_low = price_info["low"]
+
+                    triggered = False
+                    if condition == "GTE" and (curr_price >= target_price or curr_high >= target_price):
+                        triggered = True
+                    elif condition == "LTE" and (curr_price <= target_price or curr_low <= target_price):
+                        triggered = True
+
+                    if triggered:
+                        mark_alert_triggered(alert_id)
+                        cond_sign = "≥" if condition == "GTE" else "≤"
+                        arrow = "↗ ВВЕРХ" if condition == "GTE" else "↘ ВНИЗ"
+                        msg = (
+                            f"⚡ <b>МОЛНИЕНОСНЫЙ АЛЕРТ: #{ticker}</b>\n\n"
+                            f"🎯 <b>Цель:</b> {cond_sign} <code>{target_price:,.2f} ₽</code> ({arrow})\n"
+                            f"📊 <b>Текущая цена:</b> <b>{curr_price:,.2f} ₽</b>\n"
+                            f"📈 <b>Дневной High:</b> {curr_high:,.2f} ₽ | <b>Low:</b> {curr_low:,.2f} ₽\n"
+                            f"📌 <i>Рынок: {price_info['type']} | Изм: {price_info['chg']:+.2f}%</i>\n\n"
+                            f"🚀 <i>Проверь стакан в терминале!</i>"
+                        )
+                        try:
+                            await bot.send_message(chat_id, msg)
+                        except Exception as e:
+                            logger.warning(f"Не удалось отправить алерт пользователю {chat_id}: {e}")
+
+            except Exception as e:
+                logger.error(f"Ошибка в fast_price_alerts_monitor: {e}")
+
+            await asyncio.sleep(3)
+
+
 async def background_market_monitor():
-    """Фоновый периодический мониторинг рынка: проверка персональных алертов и авто-сигналов."""
+    """Фоновый периодический мониторинг рынка: авто-рассылка аномалий подписчикам каждые 5 мин."""
     logger.info("Фоновый авто-сканер рынка запущен.")
-    await asyncio.sleep(10)  # Небольшая пауза перед первым проходом
+    await asyncio.sleep(15)
 
     while True:
         try:
             status, _ = get_market_status()
             market_is_open = ("Основная" in status or "Вечерняя" in status)
 
-            # Сканируем рынок
-            items = await scan_market()
-            prices_by_ticker = {i["ticker"]: i for i in items}
-
-            # 1. Проверка персональных ценовых алертов пользователей
-            active_alerts = get_active_price_alerts()
-            for alert_id, chat_id, ticker, target_price, condition in active_alerts:
-                info = prices_by_ticker.get(ticker)
-                if not info:
-                    continue
-                last_price = info["last"]
-                triggered = False
-                if condition == "GTE" and last_price >= target_price:
-                    triggered = True
-                elif condition == "LTE" and last_price <= target_price:
-                    triggered = True
-
-                if triggered:
-                    mark_alert_triggered(alert_id)
-                    cond_sign = "≥" if condition == "GTE" else "≤"
-                    msg = (
-                        f"🎯 <b>СРАБОТАЛ ЦЕНОВОЙ АЛЕРТ!</b>\n\n"
-                        f"Акция: <b>{ticker}</b>\n"
-                        f"Текущая цена: <b>{last_price:,.2f} ₽</b> (условие: {cond_sign} {target_price:,.2f} ₽)\n"
-                        f"Дневное изменение: <b>{info['chg']:+.2f}%</b>"
-                    )
-                    try:
-                        await bot.send_message(chat_id, msg)
-                    except Exception as e:
-                        logger.warning(f"Не удалось отправить алерт пользователю {chat_id}: {e}")
-
-            # 2. Проверка аномалий для подписчиков (только во время торгов)
             if market_is_open:
                 subscribers = get_subscribers()
                 if subscribers:
+                    items = await scan_market()
                     current_time = time.time()
                     for item in items:
                         t = item["ticker"]
@@ -349,7 +414,7 @@ async def background_market_monitor():
         except Exception as e:
             logger.error(f"Ошибка в фоновом цикле мониторинга: {e}", exc_info=True)
 
-        await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+        await asyncio.sleep(300)
 
 
 async def main():
@@ -358,6 +423,7 @@ async def main():
     logger.info("Запуск Telegram-бота MOEX Radar v2.0...")
 
     # Запуск фонового мониторинга рынка
+    asyncio.create_task(fast_price_alerts_monitor())
     asyncio.create_task(background_market_monitor())
 
     await bot.delete_webhook(drop_pending_updates=True)

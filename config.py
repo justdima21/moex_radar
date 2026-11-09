@@ -18,5 +18,5 @@ DEFAULT_TICKERS = [
 ]
 
 # Параметры авто-сканера
-SCAN_INTERVAL_SECONDS = 15  # Проверка каждые 5 минут
+SCAN_INTERVAL_SECONDS = 15  # Проверка алертов каждые 15 секунд (быстрый трейдинг)
 ALERT_VOLUME_THRESHOLD = 2.5  # Порог объема для push-алерта (2.5x от нормы)
