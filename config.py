@@ -18,5 +18,5 @@ DEFAULT_TICKERS = [
 ]
 
 # Параметры авто-сканера
-SCAN_INTERVAL_SECONDS = 300  # Проверка каждые 5 минут
+SCAN_INTERVAL_SECONDS = 15  # Проверка каждые 5 минут
 ALERT_VOLUME_THRESHOLD = 2.5  # Порог объема для push-алерта (2.5x от нормы)
